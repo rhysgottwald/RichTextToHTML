@@ -1,3 +1,7 @@
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function copyFormattedText() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -23,36 +27,33 @@ function copyFormattedText() {
       var styleRuns = richTextValue.getRuns();
 
       styleRuns.forEach(function (run) {
-        var text = run.getText();
+        var text = escapeHtml(run.getText());
         var style = run.getTextStyle();
-        var linkUrl = run.getLinkUrl();
 
         // Apply all formatting
         if (style.isStrikethrough()) text = '<strike>' + text + '</strike>';
         if (style.isBold()) text = '<strong>' + text + '</strong>';
         if (style.isItalic()) text = '<em>' + text + '</em>';
-
-        var color = style.getForegroundColor();
-        var size = style.getFontSize();
-
-        var spanStyles = '';
-        if (color && color !== "#000000" && (!linkUrl || color !== "#1155cc")) spanStyles += 'color: ' + color + ';';
-        if (size && size > 10) spanStyles += 'font-size:' + size + 'px;';
-        if (spanStyles !== '') text = '<span style="' + spanStyles + '">' + text + '</span>\n';
-
-        if (style.isUnderline() && !linkUrl) text = '<u>' + text + '</u>';
-        if (linkUrl) text = '<a href="' + linkUrl + '">' + text + '</a>';
+        if (style.isUnderline()) text = '<u>' + text + '</u>';
 
         styledText += text;
 
       });
+
+      // Collapse formatting tags that wrap only whitespace (artifact of run
+      // splitting, e.g. a space between a list marker and its text getting
+      // its own bold run) so marker regexes in processLists see real whitespace.
+      var prevStyledText;
+      do {
+        prevStyledText = styledText;
+        styledText = styledText.replace(/<(strong|em|strike|u)>(\s*)<\/\1>/g, '$2');
+      } while (styledText !== prevStyledText);
 
       // Detect for lists
       styledText = processLists(styledText);
 
       // Finally detect and clean up line breaks
       styledText = styledText.replace(/(<\/li>|<\/ul>|<\/ol>)\n/g, "$1").replace(/\n/g, "<br />");
-      styledText = styledText.replace(/<\/span><br \/>/g, '</span>');
     }
 
     // Set the value of the cell in the 'HTMLText' column to the styledText
@@ -62,32 +63,48 @@ function copyFormattedText() {
 
 function processLists(text) {
   var lines = text.split('\n');
-  var stack = [];
+  var stack = []; // {type: 'ol'|'ul' (closing tag), marker: markerType, level: indent level}
   var output = [];
+
+  var closingTypeFor = function(mType) {
+    return (mType === 'number' || mType === 'letter') ? 'ol' : 'ul';
+  };
+
+  var openTagFor = function(mType) {
+    if (mType === 'letter') return '<ol type="a">';
+    if (mType === 'number') return '<ol>';
+    return '<ul>';
+  };
 
   for (var j = 0; j < lines.length; j++) {
     var line = lines[j];
-    
+
+    // Each 2-space indent is one nesting level.
+    var indentSpaces = line.match(/^ */)[0].length;
+    var level = Math.floor(indentSpaces / 2);
+    var rest = line.slice(indentSpaces);
+
+    // Marker may be wrapped in a leading formatting tag (e.g. whole line bolded);
+    // strip it before matching the marker, then reattach around the content.
+    // Only matches our own emitted tags (cell text is HTML-escaped) so literal
+    // angle-bracket text typed by a user is never mistaken for a tag.
+    var tagPrefixMatch = rest.match(/^(<(?:strong|em|strike|u)>)+/);
+    var tagPrefix = tagPrefixMatch ? tagPrefixMatch[0] : '';
+    var unprefixed = rest.slice(tagPrefix.length);
+
     var isListItem = false;
     var markerContent = "";
     var markerType = "";
 
-    if (line.startsWith('  - ')) {
-      isListItem = true;
-      markerContent = line.substring(4).trim();
-      markerType = 'nested-dash';
-    } else {
-      var trimmed = line.trim();
-      var matchNumber = trimmed.match(/^(\d+)\.\s+(.*)/);
-      var matchLetter = trimmed.match(/^([a-z])\.\s+(.*)/);
-      var matchNormalDash = trimmed.match(/^-\s+(.*)/);
-      var matchStar = trimmed.match(/^\*\s+(.*)/);
+    var matchNumber = unprefixed.match(/^(\d+)\.\s+(.*)/);
+    var matchLetter = unprefixed.match(/^([a-z])\.\s+(.*)/);
+    var matchDash = unprefixed.match(/^-\s+(.*)/);
+    var matchStar = unprefixed.match(/^\*\s+(.*)/);
 
-      if (matchNumber) { isListItem = true; markerContent = matchNumber[2].trim(); markerType = 'number'; }
-      else if (matchLetter) { isListItem = true; markerContent = matchLetter[2].trim(); markerType = 'letter'; }
-      else if (matchNormalDash) { isListItem = true; markerContent = matchNormalDash[1].trim(); markerType = 'dash'; }
-      else if (matchStar) { isListItem = true; markerContent = matchStar[1].trim(); markerType = 'star'; }
-    }
+    if (matchNumber) { isListItem = true; markerContent = tagPrefix + matchNumber[2].trim(); markerType = 'number'; }
+    else if (matchLetter) { isListItem = true; markerContent = tagPrefix + matchLetter[2].trim(); markerType = 'letter'; }
+    else if (matchDash) { isListItem = true; markerContent = tagPrefix + matchDash[1].trim(); markerType = 'dash'; }
+    else if (matchStar) { isListItem = true; markerContent = tagPrefix + matchStar[1].trim(); markerType = 'star'; }
 
     if (!isListItem) {
       while (stack.length > 0) {
@@ -109,54 +126,22 @@ function processLists(text) {
 
     var liStr = "<li>" + markerContent + "</li>";
 
-    var initListStr = function(mType, parentType) {
-      if (mType === 'nested-dash') {
-        return parentType === 'ol' ? '<ol>' : '<ul>';
-      }
-      if (mType === 'letter') return '<ol type="a">';
-      if (mType === 'number') return '<ol>';
-      return '<ul>';
-    };
+    // Close any deeper, now-finished sublists.
+    while (stack.length > 0 && stack[stack.length - 1].level > level) {
+      output[output.length - 1] += "</" + stack.pop().type + ">";
+    }
 
-    if (stack.length === 0) {
-      var t = (markerType === 'number' || markerType === 'letter') ? 'ol' : 'ul';
-      stack.push({ type: t, marker: markerType });
-      output.push(initListStr(markerType, null) + liStr);
+    var top = stack.length > 0 ? stack[stack.length - 1] : null;
+
+    if (top && top.level === level && top.marker === markerType) {
+      output.push(liStr);
     } else {
-      var top = stack[stack.length - 1];
-
-      var isContinuing = (top.marker === markerType);
-      var isStartingSublist = (markerType === 'nested-dash' && top.marker !== 'nested-dash');
-
-      if (isContinuing) {
-        output.push(liStr);
-      } else if (isStartingSublist) {
-        var parentType = top.type; // 'ol' or 'ul'
-        stack.push({ type: parentType, marker: 'nested-dash' });
-        output.push(initListStr('nested-dash', parentType) + liStr);
-      } else {
-        var matchedParentIndex = -1;
-        for (var k = stack.length - 2; k >= 0; k--) {
-          if (stack[k].marker === markerType) {
-            matchedParentIndex = k;
-            break;
-          }
-        }
-
-        if (matchedParentIndex !== -1) {
-          while (stack.length > matchedParentIndex + 1) {
-             output[output.length - 1] += "</" + stack.pop().type + ">";
-          }
-          output.push(liStr);
-        } else {
-          while (stack.length > 0) {
-             output[output.length - 1] += "</" + stack.pop().type + ">";
-          }
-          var t2 = (markerType === 'number' || markerType === 'letter') ? 'ol' : 'ul';
-          stack.push({ type: t2, marker: markerType });
-          output.push(initListStr(markerType, null) + liStr);
-        }
+      if (top && top.level === level) {
+        // Same indent, different marker type: close it and start fresh.
+        output[output.length - 1] += "</" + stack.pop().type + ">";
       }
+      stack.push({ type: closingTypeFor(markerType), marker: markerType, level: level });
+      output.push(openTagFor(markerType) + liStr);
     }
   }
 
